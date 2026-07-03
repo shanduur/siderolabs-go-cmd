@@ -5,8 +5,10 @@
 package cmd_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -149,6 +151,38 @@ func (suite *CmdSuite) TestLargeStdout() {
 	stdout, err = cmd.RunWithOptions(suite.T().Context(), "/bin/sh", []string{"-c", fmt.Sprintf("printf '%%%ds' '' | tr ' ' 'x'", wantLen)}, cmd.WithFullStdoutCapture())
 	suite.Require().NoError(err)
 	suite.Assert().Len(stdout, wantLen, "stdout should not be truncated with full capture enabled")
+}
+
+func (suite *CmdSuite) TestStartWithOptions() {
+	// stream stdout via the pipe, reading lines as the process emits them
+	proc, err := cmd.StartWithOptions(suite.T().Context(), "/bin/sh", []string{"-c", "echo one; echo two"})
+	suite.Require().NoError(err)
+
+	out, err := io.ReadAll(proc.Stdout)
+	suite.Require().NoError(err)
+	suite.Assert().Equal("one\ntwo\n", string(out))
+	suite.Assert().NoError(proc.Wait())
+
+	// stream to a caller-provided writer
+	var buf bytes.Buffer
+
+	proc, err = cmd.StartWithOptions(suite.T().Context(), "/bin/sh", []string{"-c", "echo hi"}, cmd.WithStdout(&buf))
+	suite.Require().NoError(err)
+	suite.Assert().NoError(proc.Wait())
+	suite.Assert().Equal("hi\n", buf.String())
+
+	// non-zero exit surfaces as *ExitError
+	proc, err = cmd.StartWithOptions(suite.T().Context(), "false", nil)
+	suite.Require().NoError(err)
+	_, _ = io.ReadAll(proc.Stdout) //nolint:errcheck // ignore error, we just want to wait for the process to finish
+
+	err = proc.Wait()
+	suite.Assert().Error(err)
+
+	var exitErr *cmd.ExitError
+
+	suite.Assert().ErrorAs(err, &exitErr)
+	suite.Assert().Equal(1, exitErr.ExitCode)
 }
 
 func TestCmdSuite(t *testing.T) {

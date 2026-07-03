@@ -72,6 +72,8 @@ func RunContext(ctx context.Context, name string, args ...string) (string, error
 // Options are used to configure the command execution.
 type Options struct {
 	Stdin             io.Reader
+	Stdout            io.Writer
+	Stderr            io.Writer
 	CaptureFullStdout bool
 }
 
@@ -89,6 +91,24 @@ func WithStandardInput(stdin io.Reader) Option {
 func WithFullStdoutCapture() Option {
 	return func(opts *Options) {
 		opts.CaptureFullStdout = true
+	}
+}
+
+// WithStdout returns an Option that streams the command's stdout to w.
+//
+// Only used by StartWithOptions; ignored by RunWithOptions.
+func WithStdout(w io.Writer) Option {
+	return func(opts *Options) {
+		opts.Stdout = w
+	}
+}
+
+// WithStderr returns an Option that streams the command's stderr to w.
+//
+// Only used by StartWithOptions; ignored by RunWithOptions.
+func WithStderr(w io.Writer) Option {
+	return func(opts *Options) {
+		opts.Stderr = w
 	}
 }
 
@@ -161,4 +181,99 @@ func RunWithOptions(ctx context.Context, name string, args []string, options ...
 	}
 
 	return stdout.String(), nil
+}
+
+// Process is a handle to a command started with StartWithOptions.
+type Process struct {
+	// Stdout is a pipe from the command's stdout, set only when WithStdout was
+	// not passed. The caller must read it (until EOF) to avoid blocking the
+	// process, and finish reading before calling Wait.
+	Stdout io.ReadCloser
+	// Stderr is a pipe from the command's stderr, set only when WithStderr was
+	// not passed. Same read-before-Wait contract as Stdout.
+	Stderr io.ReadCloser
+
+	cmd         *exec.Cmd
+	notifyCh    chan reaper.ProcessInfo
+	usingReaper bool
+}
+
+// StartWithOptions starts a (potentially long-running) command and returns
+// without waiting for it to finish.
+//
+// Unless WithStdout/WithStderr are passed, Process.Stdout/Process.Stderr expose
+// pipes to stream the command's output. The caller must consume them and then
+// call Wait to release resources.
+func StartWithOptions(ctx context.Context, name string, args []string, options ...Option) (*Process, error) {
+	var opts Options
+
+	for _, option := range options {
+		option(&opts)
+	}
+
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdin = opts.Stdin
+
+	p := &Process{cmd: cmd}
+
+	if opts.Stdout != nil {
+		cmd.Stdout = opts.Stdout
+	} else {
+		var err error
+
+		if p.Stdout, err = cmd.StdoutPipe(); err != nil {
+			return nil, err
+		}
+	}
+
+	if opts.Stderr != nil {
+		cmd.Stderr = opts.Stderr
+	} else {
+		var err error
+
+		if p.Stderr, err = cmd.StderrPipe(); err != nil {
+			return nil, err
+		}
+	}
+
+	p.notifyCh = make(chan reaper.ProcessInfo, 8)
+	p.usingReaper = reaper.Notify(p.notifyCh)
+
+	if err := cmd.Start(); err != nil {
+		if p.usingReaper {
+			reaper.Stop(p.notifyCh)
+		}
+
+		return nil, err
+	}
+
+	return p, nil
+}
+
+// Wait waits for the command to exit, returning an *ExitError on a non-zero
+// exit code. It must be called exactly once, after any Stdout/Stderr pipes have
+// been fully read.
+func (p *Process) Wait() error {
+	if p.usingReaper {
+		defer reaper.Stop(p.notifyCh)
+	}
+
+	err := reaper.WaitWrapper(p.usingReaper, p.notifyCh, p.cmd)
+	if err == nil {
+		return nil
+	}
+
+	var (
+		reaperErr *reaper.ExitError
+		execErr   *exec.ExitError
+	)
+
+	switch {
+	case errors.As(err, &reaperErr):
+		return &ExitError{ExitCode: reaperErr.ExitCode}
+	case errors.As(err, &execErr) && execErr.ExitCode() != -1:
+		return &ExitError{ExitCode: execErr.ExitCode()}
+	}
+
+	return err
 }
