@@ -174,6 +174,7 @@ func (suite *CmdSuite) TestStartWithOptions() {
 	// non-zero exit surfaces as *ExitError
 	proc, err = cmd.StartWithOptions(suite.T().Context(), "false", nil)
 	suite.Require().NoError(err)
+
 	_, _ = io.ReadAll(proc.Stdout) //nolint:errcheck // ignore error, we just want to wait for the process to finish
 
 	err = proc.Wait()
